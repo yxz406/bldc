@@ -45,6 +45,7 @@
 #if HAS_BLACKMAGIC
 #include "bm_if.h"
 #endif
+#include "minilzo.h"
 
 #include <math.h>
 #include <string.h>
@@ -222,16 +223,39 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		reply_func(send_buffer, ind);
 	} break;
 
+	case COMM_WRITE_NEW_APP_DATA_ALL_CAN_LZO:
 	case COMM_WRITE_NEW_APP_DATA_ALL_CAN:
+		if (packet_id == COMM_WRITE_NEW_APP_DATA_ALL_CAN_LZO) {
+			chMtxLock(&send_buffer_mutex);
+			memcpy(send_buffer_global, data + 6, len - 6);
+			int32_t ind = 4;
+			lzo_uint decompressed_len = buffer_get_uint16(data, &ind);
+			lzo1x_decompress_safe(send_buffer_global, len - 6, data + 4, &decompressed_len, NULL);
+			chMtxUnlock(&send_buffer_mutex);
+			len = decompressed_len + 4;
+		}
+
 		if (nrf_driver_ext_nrf_running()) {
 			nrf_driver_pause(2000);
 		}
 
 		data[-1] = COMM_WRITE_NEW_APP_DATA;
+
 		comm_can_send_buffer(255, data - 1, len + 1, 2);
 		/* Falls through. */
 		/* no break */
+	case COMM_WRITE_NEW_APP_DATA_LZO:
 	case COMM_WRITE_NEW_APP_DATA: {
+		if (packet_id == COMM_WRITE_NEW_APP_DATA_LZO) {
+			chMtxLock(&send_buffer_mutex);
+			memcpy(send_buffer_global, data + 6, len - 6);
+			int32_t ind = 4;
+			lzo_uint decompressed_len = buffer_get_uint16(data, &ind);
+			lzo1x_decompress_safe(send_buffer_global, len - 6, data + 4, &decompressed_len, NULL);
+			chMtxUnlock(&send_buffer_mutex);
+			len = decompressed_len + 4;
+		}
+
 		int32_t ind = 0;
 		uint32_t new_app_offset = buffer_get_uint32(data, &ind);
 
@@ -239,6 +263,8 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 			nrf_driver_pause(2000);
 		}
 		uint16_t flash_res = flash_helper_write_new_app_data(new_app_offset, data + ind, len - ind);
+
+		SHUTDOWN_RESET();
 
 		ind = 0;
 		uint8_t send_buffer[50];
@@ -521,7 +547,9 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		buffer_append_int32(send_buffer, (int32_t)(app_balance_get_motor_current() * 1000000.0), &ind);
 		buffer_append_int32(send_buffer, (int32_t)(app_balance_get_motor_position() * 1000000.0), &ind);
 		buffer_append_uint16(send_buffer, app_balance_get_state(), &ind);
-		buffer_append_uint16(send_buffer, app_balance_get_switch_value(), &ind);
+		buffer_append_uint16(send_buffer, app_balance_get_switch_state(), &ind);
+		buffer_append_int32(send_buffer, (int32_t)(app_balance_get_adc1() * 1000000.0), &ind);
+		buffer_append_int32(send_buffer, (int32_t)(app_balance_get_adc2() * 1000000.0), &ind);
 		reply_func(send_buffer, ind);
 	} break;
 
@@ -754,6 +782,7 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		mcconf.l_watt_min = buffer_get_float32_auto(data, &ind) / controller_num;
 		mcconf.l_watt_max = buffer_get_float32_auto(data, &ind) / controller_num;
 
+
 		// Write divided data back to the buffer, as the other controllers have no way to tell
 		// how many controllers are on the bus and thus need pre-divided data.
 		// We set divide by controllers to false before forwarding.
@@ -761,10 +790,18 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		buffer_append_float32_auto(data, mcconf.l_watt_min, &ind);
 		buffer_append_float32_auto(data, mcconf.l_watt_max, &ind);
 
+		// Battery limits can be set optionally in a backwards-compatible way.
+		if ((int32_t)len >= (ind + 8)) {
+			mcconf.l_in_current_min = buffer_get_float32_auto(data, &ind);
+			mcconf.l_in_current_max = buffer_get_float32_auto(data, &ind);
+		}
+
 		mcconf.lo_current_min = mcconf.l_current_min * mcconf.l_current_min_scale;
 		mcconf.lo_current_max = mcconf.l_current_max * mcconf.l_current_max_scale;
 		mcconf.lo_current_motor_min_now = mcconf.lo_current_min;
 		mcconf.lo_current_motor_max_now = mcconf.lo_current_max;
+		mcconf.lo_in_current_min = mcconf.l_in_current_min;
+		mcconf.lo_in_current_max = mcconf.l_in_current_max;
 
 		commands_apply_mcconf_hw_limits(&mcconf);
 
@@ -934,6 +971,47 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 		reply_func(send_buffer, ind);
 	} break;
 
+	case COMM_SET_CURRENT_REL: {
+		int32_t ind = 0;
+		mc_interface_set_current_rel(buffer_get_float32(data, 1e5, &ind));
+		timeout_reset();
+	} break;
+
+	case COMM_CAN_FWD_FRAME: {
+		int32_t ind = 0;
+		uint32_t id = buffer_get_uint32(data, &ind);
+		bool is_ext = data[ind++];
+
+		if (is_ext) {
+			comm_can_transmit_eid(id, data + ind, len - ind);
+		} else {
+			comm_can_transmit_sid(id, data + ind, len - ind);
+		}
+	} break;
+
+	case COMM_SET_CAN_MODE: {
+		int32_t ind = 0;
+		bool store = data[ind++];
+		bool ack = data[ind++];
+		int mode = data[ind++];
+
+		appconf = *app_get_configuration();
+		appconf.can_mode = mode;
+
+		if (store) {
+			conf_general_store_app_configuration(&appconf);
+		}
+
+		app_set_configuration(&appconf);
+
+		if (ack) {
+			ind = 0;
+			uint8_t send_buffer[50];
+			send_buffer[ind++] = packet_id;
+			reply_func(send_buffer, ind);
+		}
+	} break;
+
 	// Blocking commands. Only one of them runs at any given time, in their
 	// own thread. If other blocking commands come before the previous one has
 	// finished, they are discarded.
@@ -948,6 +1026,7 @@ void commands_process_packet(unsigned char *data, unsigned int len,
 	case COMM_PING_CAN:
 	case COMM_BM_CONNECT:
 	case COMM_BM_ERASE_FLASH_ALL:
+	case COMM_BM_WRITE_FLASH_LZO:
 	case COMM_BM_WRITE_FLASH:
 	case COMM_BM_REBOOT:
 	case COMM_BM_DISCONNECT:
@@ -1010,6 +1089,21 @@ void commands_send_experiment_samples(float *samples, int len) {
 		buffer_append_int32(buffer, (int32_t)(samples[i] * 10000.0), &index);
 	}
 
+	commands_send_packet(buffer, index);
+}
+
+void commands_fwd_can_frame(int len, unsigned char *data, uint32_t id, bool is_extended) {
+	if (len > 8) {
+		len = 8;
+	}
+
+	uint8_t buffer[len + 6];
+	int32_t index = 0;
+	buffer[index++] = COMM_CAN_FWD_FRAME;
+	buffer_append_uint32(buffer, id, &index);
+	buffer[index++] = is_extended;
+	memcpy(buffer + index, data, len);
+	index += len;
 	commands_send_packet(buffer, index);
 }
 
@@ -1162,7 +1256,7 @@ static THD_FUNCTION(blocking_thread, arg) {
 
 		COMM_PACKET_ID packet_id;
 		static mc_configuration mcconf, mcconf_old;
-		static uint8_t send_buffer[384];
+		static uint8_t send_buffer[512];
 
 		packet_id = data[0];
 		data++;
@@ -1410,7 +1504,16 @@ static THD_FUNCTION(blocking_thread, arg) {
 			}
 		} break;
 
+		case COMM_BM_WRITE_FLASH_LZO:
 		case COMM_BM_WRITE_FLASH: {
+			if (packet_id == COMM_BM_WRITE_FLASH_LZO) {
+				memcpy(send_buffer, data + 6, len - 6);
+				int32_t ind = 4;
+				lzo_uint decompressed_len = buffer_get_uint16(data, &ind);
+				lzo1x_decompress_safe(send_buffer, len - 6, data + 4, &decompressed_len, NULL);
+				len = decompressed_len + 4;
+			}
+
 			int32_t ind = 0;
 			uint32_t addr = buffer_get_uint32(data, &ind);
 
@@ -1435,6 +1538,7 @@ static THD_FUNCTION(blocking_thread, arg) {
 
 		case COMM_BM_DISCONNECT: {
 			bm_disconnect();
+			bm_leave_nrf_debug_mode();
 
 			int32_t ind = 0;
 			send_buffer[ind++] = packet_id;
@@ -1468,7 +1572,6 @@ static THD_FUNCTION(blocking_thread, arg) {
 				send_func_blocking(send_buffer, ind);
 			}
 		} break;
-#endif
 
 		case COMM_BM_MEM_READ: {
 			int32_t ind = 0;
@@ -1488,6 +1591,7 @@ static THD_FUNCTION(blocking_thread, arg) {
 				send_func_blocking(send_buffer, ind + read_len);
 			}
 		} break;
+#endif
 
 		default:
 			break;
